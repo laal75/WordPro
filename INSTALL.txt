@@ -1,0 +1,97 @@
+WordPro installation
+====================
+
+WordPro is a Python terminal word processor for Linux. Python 3 with curses
+support is required. Spell checking and grammar checking have optional local
+integrations; they are not required to run WordPro.
+
+Install for your account
+------------------------
+
+1. Keep install.sh and wordpro.py in the same folder.
+2. Open a terminal in that folder.
+3. Run:
+
+       ./install.sh --user
+
+WordPro is added to your applications menu as “WordPro”. You can also run
+`~/.local/bin/wordpro` from a terminal. Your desktop environment may require
+you to sign out and back in before the menu entry appears.
+
+For automatic local LanguageTool setup, add `--with-languagetool`:
+
+       ./install.sh --user --with-languagetool
+
+This downloads the official standalone server (about 252 MB). Java 17 or newer,
+`unzip`, and `curl` or `wget` are required. The server starts automatically
+when you launch WordPro and stays bound to localhost.
+
+Install for all users (system-wide)
+-----------------------------------
+
+1. Keep install.sh and wordpro.py together in a folder accessible to the
+   administrator account.
+2. Open a terminal in that folder.
+3. Run:
+
+       sudo ./install.sh --system
+
+Add `--with-languagetool` to download and configure the local server during
+installation:
+
+       sudo ./install.sh --system --with-languagetool
+
+This installs the WordPro program under /usr/local, adds one “WordPro” entry
+to the system applications menu, and makes the `wordpro` command available.
+
+Uninstall
+---------
+
+For your account:
+
+       ./install.sh --user --uninstall
+
+System-wide (run from the same folder):
+
+       sudo ./install.sh --system --uninstall
+
+Uninstalling removes the program and launcher. It keeps your documents and
+WordPro recovery data in your home folder.
+
+Using WordPro
+-------------
+
+Launch “WordPro” from the applications menu or run `wordpro` in a terminal.
+The startup list shows .rtf and .txt files in the launch folder. Use Ctrl-O
+to open a document from another folder. Documents are saved as RTF by default.
+
+Spell checking
+--------------
+
+For dictionary-based spell checking, install Hunspell. WordPro ships with an
+English (US) Hunspell dictionary and uses it automatically when the `hunspell`
+command is available. On Debian or Ubuntu, install it with:
+
+       sudo apt install hunspell
+
+WordPro can also use another Hunspell dictionary: choose GRAMMAR, then Import
+Hunspell dictionary, and enter the path to its `.dic` file. Its matching `.aff`
+file must be beside it. Without Hunspell, WordPro checks a small set of common
+typos.
+
+Grammar checking
+----------------
+
+WordPro always has built-in checks for repeated words, punctuation spacing,
+sentence capitalization, and common errors such as “could of” and “alot”. To
+deploy LanguageTool automatically, install WordPro with `--with-languagetool`.
+The installer downloads the official standalone server; Java 17 or newer,
+`unzip`, and `curl` or `wget` are needed. The server starts automatically when
+WordPro launches, listens only on localhost port 8081, and the app sends
+document text only to that local server. You can also run your own local
+LanguageTool server and point WordPro at it by setting
+`WORDPRO_LANGUAGETOOL_URL`, for example:
+
+       WORDPRO_LANGUAGETOOL_URL=http://127.0.0.1:8081 wordpro
+
+If LanguageTool is unavailable, the built-in grammar rules continue to work.
