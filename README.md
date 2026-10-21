@@ -5,7 +5,7 @@
 WordPro brings the feel of a classic dedicated word processor to a modern Linux terminal, with an amber-on-dark interface, keyboard-driven menus, document formatting, and local proofreading tools.
 
 
-![WordPro running in the terminal](screenshot.png)
+![WordPro running in the terminal](Screenshot.png)
 
 
 ## Features
