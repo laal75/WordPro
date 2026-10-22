@@ -199,7 +199,12 @@ class WordProcessor:
                 if not last_of_para:
                     _,jmap=self.justify_with_map(self.lines[n],text_width)
                     if 0<=self.x<len(jmap) and jmap[self.x]>=0:col=jmap[self.x]
-            cx=x0+indent+col
+            # Clamp to the actual text viewport. A line may have been wrapped
+            # using a wider layout before a terminal resize; never leave the
+            # hardware cursor outside the writing pane while the next redraw
+            # catches up.
+            col=max(0,min(col,text_width-1))
+            cx=max(x0,min(x0+width-1,x0+indent+col))
             if y0<=cy<h-3 and cx<w-1:
                 cursor_pos=(cy,cx)
         return cursor_pos
@@ -234,25 +239,22 @@ class WordProcessor:
         self.put(5,c1[0],"CONTEXT",curses.A_DIM)
         self.put(5,c2[0],"WRITING",hi if self.focus=="editor" else curses.A_DIM)
         self.put(5,c3[0],"NOTES  [F12]",hi if self.focus=="notes" else curses.A_DIM)
-        # Row 6: a separator across every pane. The writing pane shows its
-        # margin ruler spanning EXACTLY the text width, so 'L' and 'R' sit at
-        # the left and right edges of the writing area. The document's lines are
-        # stored wrapped to content_width(), so the ruler matches that (capped
-        # at the pane width) — otherwise a wide pane leaves 'R' past the text.
-        # Both the text and its ruler are centred within the writing pane.
+        # Row 6: show the page ruler, including margin markers, at the same
+        # width as the page text. Do not stretch it to fill unused pane space.
         w2_width=c2[1]-c2[0]+1
-        w_left,w_right=self.effective_margins(w2_width)
-        text_width=max(1,w2_width-w_left-w_right)
-        ruler_width=min(text_width,max(1,self.content_width()))
-        center_offset=max(0,(w2_width-ruler_width)//2)
-        center_right=max(0,w2_width-center_offset-ruler_width)
+        page_width=max(1,min(w2_width,self.page_columns))
+        w_left,w_right=self.effective_margins(page_width)
+        center_offset=max(0,(w2_width-page_width)//2)
+        center_right=max(0,w2_width-center_offset-page_width)
         self.put(6,c1[0],"─"*(c1[1]-c1[0]+1),curses.A_DIM)
-        self.render_ruler(6,c2[0]+center_offset,ruler_width,0,0)
+        self.render_ruler(6,c2[0]+center_offset,page_width,w_left,w_right)
         self.put(6,c3[0],"─"*(c3[1]-c3[0]+1),curses.A_DIM)
-        # Render context on the left (c1)
         self.render_context(c1[0],c1[1]-c1[0]+1,y0,rows)
-        # Render writing in the center (c2), centred within the pane
-        editor_pos=self.render_editor_content(c2[0],w2_width,y0,indent=center_offset,right_margin=center_right,max_rows=rows)
+        editor_pos=self.render_editor_content(
+            c2[0],w2_width,y0,
+            indent=center_offset+w_left,
+            right_margin=center_right+w_right,
+            max_rows=rows)
         # Render notes on the right (c3)
         notes_pos=self.render_pane_text(c3[0],c3[1]-c3[0]+1,y0,rows,self.notes,
                                        scroll=self.notes_top,cursor=(self.ny,self.nx) if self.focus=="notes" else None)
@@ -1309,11 +1311,20 @@ class WordProcessor:
         self.message=f"{item} toggled."
 
     def content_width(self):
-        """Width the document lines are wrapped to. Never falls below
-        MIN_TEXT_WIDTH: if the terminal briefly reports a narrow size (e.g.
-        mid-resize) the wrap width must not collapse and re-split every word
-        onto its own line."""
-        page_width=max(1,min(self.page_columns,self.s.getmaxyx()[1]-10))
+        """Return the width available to document text in the active layout.
+
+        In three-pane mode the centre writing pane, not the whole terminal or
+        virtual page width, is the hard limit. This keeps wrapping and cursor
+        placement inside the visible writing area on smaller monitors.
+        """
+        if self.wide_mode():
+            _, writing, _, _, _ = self.pane_bounds()
+            pane_width=max(1, writing[1]-writing[0]+1)
+            page_width=max(1,min(pane_width,self.page_columns))
+            left,right=self.effective_margins(page_width)
+            return max(1, page_width-left-right)
+        terminal_width=self.s.getmaxyx()[1]
+        page_width=max(1,min(self.page_columns,terminal_width-10))
         left,right=self.effective_margins(page_width)
         return max(MIN_TEXT_WIDTH,page_width-left-right)
 

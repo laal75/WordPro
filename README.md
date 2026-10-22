@@ -4,10 +4,6 @@
 
 WordPro brings the feel of a classic dedicated word processor to a modern Linux terminal, with an amber-on-dark interface, keyboard-driven menus, document formatting, and local proofreading tools.
 
-
-![WordPro running in the terminal](Screenshot.png)
-
-
 ## Features
 
 - Terminal-based, keyboard-driven editing.
@@ -87,7 +83,7 @@ WordPro includes an English (US) Hunspell dictionary. Its original licence and a
 
 ## Project status
 
-WordPro is done. Although Features and behaviour may change. Bug reports, suggestions, and contributions are welcome; please open an issue with steps to reproduce any problem.
+WordPro is under active development. Features and behaviour may change. Bug reports, suggestions, and contributions are welcome; please open an issue with steps to reproduce any problem.
 
 ## Licence
 
