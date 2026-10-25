@@ -18,14 +18,14 @@ from urllib.request import urlopen
 # (Grammar1+2 merged) · FORM F6 · CTR/RMF F7 · PAGE F8 · PRINT F9 · BLOCK F10
 TABS = ["FILE", "STYLE", "SCROLL", "SEARCH", "GRAMMAR", "FORM", "CTR/RMF", "PAGE", "PRINT", "BLOCK"]
 MENUS = {
-    "FILE": ["Main menu", "Save", "Save As", "Quit"],
+    "FILE": ["Main menu", "Save", "Save As", "Adjust view", "Quit"],
     "STYLE": ["Normal", "Heading 1", "Heading 2", "Heading 3", "Font size", "Bold", "Underline", "Show spaces"],
     "BLOCK": ["Copy line", "Delete line", "Move line up", "Move line down"],
     "CTR/RMF": ["Center", "Right align", "Left align", "Justify"],
-    "GRAMMAR": ["Spell check", "Grammar check", "Import Hunspell dictionary", "Word count", "Thesaurus"],
+    "GRAMMAR": ["Spell check", "Grammar check", "Auto capitalisation", "Import Hunspell dictionary", "Word count", "Thesaurus"],
     "SEARCH": ["Find", "Replace"],
     "FORM": ["Insert header line", "Insert footer line"],
-    "PAGE": ["Paper size", "Margins", "Insert page break", "Page number"],
+    "PAGE": ["Paper size", "L margin", "R margin", "Margins", "Insert page break", "Page number"],
     "PRINT": ["Print preview", "Export plain text"],
     "SCROLL": ["Scroll top", "Scroll bottom"],
 }
@@ -51,17 +51,39 @@ class WordProcessor:
         self.recovery_file=self.state_dir/"recovery.json"
         self.position_file=self.state_dir/"positions.json"
         self.added_folders_file=self.state_dir/"folders.json"
+        self.layout_file=self.state_dir/"layout.json"
         self.mounted_shares=[]
+        # Adjustable three-pane workspace: left-to-right order of the panes
+        # and each pane's share of the usable width (fractions of the whole).
+        self.pane_order=["context","writing","notes"]
+        self.pane_fractions={"context":1.0/3.0,"writing":1.0/3.0,"notes":1.0/3.0}
+        self.adjust_view=False
+        self.view_drag=None
+        self.layout_backup=None
+        try:
+            if self.layout_file.is_file():
+                d=json.loads(self.layout_file.read_text(encoding="utf-8"))
+                order=d.get("order")
+                if isinstance(order,list) and sorted(order)==["context","notes","writing"] and len(order)==3:
+                    self.pane_order=list(order)
+                fr=d.get("fractions")
+                if isinstance(fr,dict) and all(float(fr.get(n,0))>0 for n in self.pane_order):
+                    self.pane_fractions={n:float(fr[n]) for n in self.pane_order}
+        except (OSError,ValueError,TypeError,KeyError):
+            self.pane_order=["context","writing","notes"]
+            self.pane_fractions={"context":1.0/3.0,"writing":1.0/3.0,"notes":1.0/3.0}
         self.legacy_recovery_file=self.legacy_state_dir/"recovery.json"
         self.legacy_position_file=self.legacy_state_dir/"positions.json"
         self.message="F1..F10 menus (Ctrl+1..Ctrl+0 where terminal supports modified keys; F1 FILE) · F12 notes (full-height on narrow screens) · Ctrl-S save · Ctrl-O open · Ctrl-D main menu · Ctrl-C quit · 3-pane on wide screens (>=150 cols)"
         self.bold=self.underline=self.show_spaces=False; self.align="LEFT"
+        self.auto_capitalise=True
         self.left_margin=5; self.right_margin=5
         self.page_columns=72; self.page_preset="Standard"
         self.spell_dictionary=None
         # Three-pane workspace (context / writing / notes) state
         self.notes=[""]; self.ny=0; self.nx=0; self.notes_top=0; self.notes_dirty=False
         self.focus="editor"
+        self.find_term=""; self.find_last_at=-1
         self.notes_file=self.state_dir/"notes.json"
 
     @staticmethod
@@ -141,10 +163,12 @@ class WordProcessor:
         self.put(4,1,"─"*(w-2))
         y0=5
         rows=max(1,h-3-y0)
-        if self.ny<self.notes_top:self.notes_top=self.ny
-        elif self.ny>=self.notes_top+rows:self.notes_top=self.ny-rows+1
+        notes_width=max(1,w-3)
+        notes_visual=self.notes_visual_row(self.ny,self.nx,notes_width)
+        if notes_visual<self.notes_top:self.notes_top=notes_visual
+        elif notes_visual>=self.notes_top+rows:self.notes_top=notes_visual-rows+1
         notes_pos=self.render_pane_text(1,w-2,y0,rows,self.notes,
-                                        scroll=self.notes_top,cursor=(self.ny,self.nx))
+                                        scroll=self.notes_top,cursor=(self.ny,self.nx),wrap=True)
         self.put(h-3,1,"─"*(w-2))
         self.put(h-2,1,f"NOTES   LINE {self.ny+1}   COL {self.nx+1}   WORDS {len(' '.join(self.notes).split())}   CHARS {sum(map(len,self.notes))}   FOCUS NOTES")
         self.put(h-1,1,self.message)
@@ -174,7 +198,11 @@ class WordProcessor:
         for row,di in enumerate(range(start_di,min(len(items),start_di+visible))):
             kind,n=items[di]
             if kind=="sep":
-                self.put(y0+row,x0,"─"*width,curses.A_DIM); continue
+                self.put(y0+row,x0,"─"*width,curses.color_pair(1)); continue
+            if kind=="blank":
+                # Leave the rest of the page visually empty; only the page
+                # boundary itself receives a horizontal rule.
+                continue
             if kind=="break":
                 marker="─ ␌ NEW PAGE ␌ "
                 self.put(y0+row,x0,(marker+"─"*max(0,width-len(marker)))[:width],curses.A_BOLD|curses.A_DIM); continue
@@ -220,7 +248,9 @@ class WordProcessor:
         except curses.error:pass
 
     def draw_wide(self):
-        """Three-pane workspace: context (left) / writing (centre) / notes (right), equal thirds."""
+        """Three-pane workspace. Panes are drawn in self.pane_order (left to
+        right) with widths from self.pane_fractions; "Adjust view" (FILE menu)
+        changes both, using the rulers on row 6 as mouse handles."""
         self.s.erase(); h,w=self.s.getmaxyx()
         if h<12:
             self.put(0,0,"Please enlarge terminal to at least 12 rows tall."); self.s.refresh(); return
@@ -233,31 +263,57 @@ class WordProcessor:
         self.put(2,1,"─"*(w-2)); stride=max(7,(w-4)//len(TABS))
         for i,t in enumerate(TABS):self.put(3,2+i*stride,t,hi if i==self.tab else curses.A_DIM)
         self.put(4,1,"─"*(w-2))
-        c1,c2,c3,y0,y1=self.pane_bounds()
+        bounds,y0,y1=self.pane_bounds()
         rows=max(1,y1-y0)
-        # c1 = left pane (context, read-only), c2 = center (writing), c3 = right pane (notes)
-        self.put(5,c1[0],"CONTEXT",curses.A_DIM)
-        self.put(5,c2[0],"WRITING",hi if self.focus=="editor" else curses.A_DIM)
-        self.put(5,c3[0],"NOTES  [F12]",hi if self.focus=="notes" else curses.A_DIM)
-        # Row 6: show the page ruler, including margin markers, at the same
-        # width as the page text. Do not stretch it to fill unused pane space.
-        w2_width=c2[1]-c2[0]+1
-        page_width=max(1,min(w2_width,self.page_columns))
-        w_left,w_right=self.effective_margins(page_width)
-        center_offset=max(0,(w2_width-page_width)//2)
-        center_right=max(0,w2_width-center_offset-page_width)
-        self.put(6,c1[0],"─"*(c1[1]-c1[0]+1),curses.A_DIM)
-        self.render_ruler(6,c2[0]+center_offset,page_width,w_left,w_right)
-        self.put(6,c3[0],"─"*(c3[1]-c3[0]+1),curses.A_DIM)
-        self.render_context(c1[0],c1[1]-c1[0]+1,y0,rows)
-        editor_pos=self.render_editor_content(
-            c2[0],w2_width,y0,
-            indent=center_offset+w_left,
-            right_margin=center_right+w_right,
-            max_rows=rows)
-        # Render notes on the right (c3)
-        notes_pos=self.render_pane_text(c3[0],c3[1]-c3[0]+1,y0,rows,self.notes,
-                                       scroll=self.notes_top,cursor=(self.ny,self.nx) if self.focus=="notes" else None)
+        # Headers, in pane order.
+        for name in self.pane_order:
+            x0,x1=bounds[name]
+            if name=="context":
+                self.put(5,x0,"CONTEXT",curses.A_DIM)
+            elif name=="writing":
+                self.put(5,x0,"WRITING",hi if self.focus=="editor" else curses.A_DIM)
+            else:
+                self.put(5,x0,"NOTES  [F12]",hi if self.focus=="notes" else curses.A_DIM)
+        # Row 6: while adjusting the view every pane shows an interactive
+        # ruler; otherwise the writing pane shows its margin ruler and the
+        # other panes a plain separator.
+        for name in self.pane_order:
+            x0,x1=bounds[name]
+            width=x1-x0+1
+            if self.adjust_view:
+                self._draw_active_ruler(6,x0,width,name)
+            elif name=="writing":
+                page_width=max(1,min(width,self.page_columns))
+                w_left,w_right=self.effective_margins(page_width)
+                center_offset=max(0,(width-page_width)//2)
+                self.render_ruler(6,x0+center_offset,page_width,w_left,w_right)
+            else:
+                self.put(6,x0,"─"*width,curses.A_DIM)
+        # Pane content, in pane order.
+        editor_pos=None
+        notes_pos=None
+        for name in self.pane_order:
+            x0,x1=bounds[name]
+            width=x1-x0+1
+            if name=="context":
+                # Keep context text left-justified, but inset it so it does
+                # not hug the far-left side of its column.
+                context_inset=min(8,max(0,(x1-x0)//5))
+                self.render_context(x0+context_inset,max(1,width-context_inset),y0,rows)
+            elif name=="writing":
+                page_width=max(1,min(width,self.page_columns))
+                w_left,w_right=self.effective_margins(page_width)
+                center_offset=max(0,(width-page_width)//2)
+                center_right=max(0,width-center_offset-page_width)
+                editor_pos=self.render_editor_content(
+                    x0,width,y0,
+                    indent=center_offset+w_left,
+                    right_margin=center_right+w_right,
+                    max_rows=rows)
+            else:
+                notes_pos=self.render_pane_text(x0,width,y0,rows,self.notes,
+                                               scroll=self.notes_top,cursor=(self.ny,self.nx) if self.focus=="notes" else None,
+                                               wrap=True)
         self.put(h-3,1,"─"*(w-2))
         page_number=self.current_page_number(self.y)
         self.put(h-2,1,f"PAGE {page_number}   LINE {self.y+1}   COL {self.x+1}   WORDS {len(' '.join(self.lines).split())}   CHARS {sum(map(len,self.lines))}   TEXT {self.content_width()} COLS   FOCUS {self.focus.upper()}")
@@ -268,17 +324,62 @@ class WordProcessor:
         self.s.refresh()
 
     def render_context(self,x0,width,y0,rows):
-        """Pane 1: the document lines just above the editor's current view,
-        bottom-aligned so the newest sits at the bottom of the pane. The text is
-        right-aligned (starts at the right edge of the pane) so it flows into
-        the writing area, leaving a gap on the left."""
-        n=rows; end=self.top; start=max(0,end-n)
-        context=self.lines[start:end]
-        offset=max(0,rows-len(context))
+        """Show preceding document text, left-aligned and wrapped to the pane.
+
+        Wrap at word boundaries rather than truncating each line, so narrowing
+        the context pane never silently cuts off the ends of its text.
+        """
+        width=max(1,width)
+        items,line_to_di=self.display_items()
+        if 0 <= self.top < len(self.lines) and self.top in line_to_di:
+            end_di=line_to_di[self.top]
+            if end_di > 0 and items[end_di-1][0] == "sep":
+                end_di -= 1
+        else:
+            end_di=0
+
+        # Collect enough preceding logical lines to fill the visible area after
+        # wrapping. Collect extra lines because a long paragraph may wrap.
+        context=[]
+        for kind,line_index in reversed(items[:end_di]):
+            if kind == "text" and line_index is not None:
+                source_line=self.lines[line_index]
+                if not source_line:
+                    context.append("")
+                else:
+                    # Word-wrap while preserving words; split only a single
+                    # overlong word when it cannot fit on any row.
+                    wrapped=[]
+                    current=""
+                    for word in source_line.split():
+                        if not current:
+                            if len(word) <= width:
+                                current=word
+                            else:
+                                wrapped.extend(word[i:i+width] for i in range(0,len(word),width))
+                        elif len(current)+1+len(word) <= width:
+                            current += " " + word
+                        else:
+                            wrapped.append(current)
+                            if len(word) <= width:
+                                current=word
+                            else:
+                                wrapped.extend(word[i:i+width] for i in range(0,len(word),width))
+                                current=""
+                    if current:
+                        wrapped.append(current)
+                    context.extend(reversed(wrapped))
+            elif kind == "break" and line_index is not None:
+                context.append("")
+            if len(context) >= rows+width:
+                break
+
+        context=list(reversed(context))[-rows:]
+        offset=max(0,(rows-len(context))//2)
         for i,text in enumerate(context):
             r=y0+offset+i
             t=text.replace(" ","·") if self.show_spaces else text
-            self.put(r,x0,t[:width].rjust(width),curses.A_DIM)
+            self.put(r,x0,t[:width],curses.A_DIM)
 
     def render_ruler(self,row,x0,width,left,right):
         """Draw the margin ruler for a writing area `width` columns wide,
@@ -294,23 +395,87 @@ class WordProcessor:
         if right_marker!=left_marker:ruler[right_marker]="R"
         self.put(row,x0,"".join(ruler),curses.A_DIM)
 
-    def render_pane_text(self,x0,width,y0,rows,lines,scroll=0,cursor=None):
-        """Render a list of text lines into a pane. If `cursor=(line_index,
-        column)` is given (relative to the list), returns its screen position
-        (cy,cx); otherwise returns None. Does NOT move the physical cursor —
-        the caller places it last via move_cursor()."""
+    def render_pane_text(self,x0,width,y0,rows,lines,scroll=0,cursor=None,wrap=False):
+        """Render text in a pane. Optional soft wrapping keeps long notes visible
+        without inserting hard line breaks into the saved note text. When wrapping,
+        scroll is measured in displayed rows and the cursor is mapped from its
+        logical line/column to the corresponding displayed row and column."""
+        width=max(1,width)
+        visual=[]
+        if wrap:
+            for logical_i,line in enumerate(lines):
+                # Wrap on word boundaries where possible. Keep the starting
+                # character index so the cursor maps correctly after soft wraps.
+                pos=0
+                while pos < len(line):
+                    end=min(pos+width,len(line))
+                    if end < len(line):
+                        split=line.rfind(" ",pos,end+1)
+                        if split > pos:
+                            end=split
+                    chunk=line[pos:end]
+                    visual.append((logical_i,pos,chunk))
+                    pos=end
+                    while pos < len(line) and line[pos]==" ":
+                        # Spaces at a wrap boundary belong to the preceding line
+                        # visually, but remain in the underlying note unchanged.
+                        pos += 1
+                if not line:
+                    visual.append((logical_i,0,""))
+        else:
+            visual=[(i,0,line) for i,line in enumerate(lines)]
         for row in range(rows):
             i=scroll+row
-            if i>=len(lines):break
-            text=lines[i]
+            if i>=len(visual):break
+            _,_,text=visual[i]
             if self.show_spaces:text=text.replace(" ","·")
             self.put(y0+row,x0,text[:width],0)
         if cursor is not None:
             ci,cx=cursor
-            cy=y0+(ci-scroll)
+            if wrap:
+                matches=[(j,item) for j,item in enumerate(visual) if item[0]==ci]
+                chosen=matches[-1] if matches else (0,(ci,0,""))
+                for j,item in matches:
+                    _,start_col,text=item
+                    if start_col <= cx <= start_col+len(text):
+                        chosen=(j,item)
+                        if cx < start_col+len(text) or j==matches[-1][0]:
+                            break
+                cy_index,(_,start_col,text)=chosen
+                col=max(0,cx-start_col)
+            else:
+                cy_index=ci; col=cx
+            cy=y0+(cy_index-scroll)
             if y0<=cy<y0+rows:
-                return (cy,x0+min(max(0,cx),width-1))
+                return (cy,x0+min(max(0,col),width-1))
         return None
+
+    def notes_visual_row(self,line_index,column,width):
+        """Map a logical notes cursor to its soft-wrapped display row."""
+        width=max(1,width)
+        total=0
+        for i,line in enumerate(self.notes):
+            # Match render_pane_text's word-aware wrapping.
+            pos=0
+            starts=[]
+            while pos < len(line):
+                end=min(pos+width,len(line))
+                if end < len(line):
+                    split=line.rfind(" ",pos,end+1)
+                    if split > pos:
+                        end=split
+                starts.append(pos)
+                pos=end
+                while pos < len(line) and line[pos]==" ":
+                    pos += 1
+            if not starts:
+                starts=[0]
+            chunks=len(starts)
+            if i==line_index:
+                row=max((j for j,start in enumerate(starts) if start<=column),default=0)
+                return total+min(row,chunks-1)
+            total+=chunks
+        return max(0,total-1)
 
     def prompt(self,label,initial=""):
         self.s.timeout(-1); curses.noecho(); value=initial
@@ -499,7 +664,9 @@ class WordProcessor:
                 except OSError:pass
             raise
 
-    def write_recovery(self):
+    def write_recovery(self,quiet=False):
+        # quiet=True is for the background auto-save in the main loop: it must
+        # not clobber a status message the user is reading (e.g. a Find result).
         try:
             self.state_dir.mkdir(parents=True,exist_ok=True,mode=0o700)
             payload={"name":self.name,"path":str(self.path) if self.path else None,"lines":self.lines,
@@ -512,9 +679,11 @@ class WordProcessor:
                 json.dump(payload,f,ensure_ascii=False)
                 temp=Path(f.name)
             os.replace(temp,self.recovery_file)
-            self.message="Recovery draft saved."
+            if not quiet:self.message="Recovery draft saved."
             return True
-        except OSError as e:self.message=f"Recovery draft failed: {e}"; return False
+        except OSError as e:
+            if not quiet:self.message=f"Recovery draft failed: {e}"
+            return False
 
     def recover_draft(self):
         source=self.recovery_file if self.recovery_file.exists() else self.legacy_recovery_file
@@ -1176,6 +1345,51 @@ class WordProcessor:
             os.replace(temp,path); self.message=f"Exported plain text to {path}"
         except OSError as e:self.message=f"Cannot export text: {e}"
 
+    def find_next_match(self):
+        """Find the next case-insensitive occurrence, wrapping at document end."""
+        if not self.find_term:
+            term=self.prompt("FIND: ")
+            if term is None or not term.strip():
+                self.message="Find cancelled: enter a word or phrase."
+                return
+            self.find_term=term.strip()
+            self.find_last_at=-1
+
+        joined="\n".join(self.lines)
+        folded=joined.lower()
+        needle=self.find_term.lower()
+        if not needle:
+            self.message="Find cancelled: enter a word or phrase."
+            return
+
+        # Count all non-overlapping occurrences for the match indicator.
+        matches=[]
+        offset=0
+        while True:
+            at=folded.find(needle,offset)
+            if at<0:break
+            matches.append(at)
+            offset=at+len(needle)
+
+        if not matches:
+            self.find_last_at=-1
+            self.message=f"'{self.find_term}' not found (0 matches)."
+            return
+
+        if self.find_last_at >= 0:
+            start=self.find_last_at+len(needle)
+        else:
+            start=sum(len(line)+1 for line in self.lines[:self.y])+self.x
+
+        at=next((pos for pos in matches if pos>=start),matches[0])
+        self.find_last_at=at
+        self.y=joined[:at].count("\n")
+        self.x=at-(joined.rfind("\n",0,at)+1)
+        self.top=max(0,self.y-2)
+        match_number=matches.index(at)+1
+        wrapped=" (wrapped)" if at<start else ""
+        self.message=f"Find '{self.find_term}': match {match_number} of {len(matches)}{wrapped}."
+
     def action(self,item):
         if item=="Main menu":
             self.go_to_main_menu(); return
@@ -1183,6 +1397,8 @@ class WordProcessor:
             self.save(); return
         elif item=="Save As":
             self.save_as(); return
+        elif item=="Adjust view":
+            self.begin_adjust_view(); return
         elif item=="Quit":
             self.quit_flow(); return
         elif item=="Scroll top":self.y=0; self.x=min(self.x,len(self.lines[0])); self.top=0
@@ -1205,6 +1421,23 @@ class WordProcessor:
         elif item=="Bold":self.bold=not self.bold; self.dirty=True
         elif item=="Underline":self.underline=not self.underline; self.dirty=True
         elif item=="Show spaces":self.show_spaces=not self.show_spaces
+        elif item in ("L margin", "R margin"):
+            side = "left" if item == "L margin" else "right"
+            attr = "left_margin" if side == "left" else "right_margin"
+            page_width=max(MIN_TEXT_WIDTH+1,min(self.page_columns,self.s.getmaxyx()[1]-10))
+            current=getattr(self,attr)
+            value=self.prompt(f"{item.upper()} (0-{max(0,page_width-MIN_TEXT_WIDTH)} columns): ",str(current))
+            if value is None:return
+            try: candidate=int(value)
+            except (TypeError,ValueError):
+                self.message=f"{item} must be a whole number."; return
+            other=self.right_margin if side=="left" else self.left_margin
+            maximum=max(0,page_width-MIN_TEXT_WIDTH-other)
+            if candidate<0 or candidate>maximum:
+                self.message=f"{item} must be between 0 and {maximum} columns."; return
+            setattr(self,attr,candidate)
+            self.wrap_document(); self.dirty=True
+            self.message=f"{item} set to {candidate} columns (text width {self.content_width()} cols)."; return
         elif item=="Margins":self.set_margins(); return
         elif item=="Import Hunspell dictionary":
             target=self.prompt("HUNSPELL .DIC FILE (matching .AFF required): ")
@@ -1261,11 +1494,15 @@ class WordProcessor:
                 self.y=target; self.dirty=True
             self.message=f"{item} complete."; return
         elif item=="Find":
-            term=self.prompt("FIND: ")
+            term=self.prompt("FIND: ", self.find_term)
             if term is None:return
-            joined="\n".join(self.lines); at=joined.lower().find(term.lower()) if term else -1
-            if at<0:self.message=f"{term} not found."
-            else:self.y=joined[:at].count("\n"); self.x=at-(joined.rfind("\n",0,at)+1); self.top=max(0,self.y-2); self.message=f"Found {term}."
+            term=term.strip()
+            if not term:
+                self.message="Find cancelled: enter a word or phrase."
+                return
+            self.find_term=term
+            self.find_last_at=-1
+            self.find_next_match()
             return
         elif item=="Replace":
             old=self.prompt("FIND: ")
@@ -1288,6 +1525,10 @@ class WordProcessor:
         elif item=="Print preview":self.print_preview(); return
         elif item=="Spell check":self.proofread(spelling=True); return
         elif item=="Grammar check":self.proofread(spelling=False); return
+        elif item=="Auto capitalisation":
+            self.auto_capitalise=not self.auto_capitalise
+            self.message="Automatic capitalisation is "+("ON." if self.auto_capitalise else "OFF.")
+            return
         elif item=="Thesaurus":
             word=self.prompt("THESAURUS WORD: ")
             if word is None:return
@@ -1318,7 +1559,8 @@ class WordProcessor:
         placement inside the visible writing area on smaller monitors.
         """
         if self.wide_mode():
-            _, writing, _, _, _ = self.pane_bounds()
+            bounds,_,_=self.pane_bounds()
+            writing=bounds["writing"]
             pane_width=max(1, writing[1]-writing[0]+1)
             page_width=max(1,min(pane_width,self.page_columns))
             left,right=self.effective_margins(page_width)
@@ -1334,27 +1576,158 @@ class WordProcessor:
         return self.s.getmaxyx()[1]>=WIDE_MIN_WIDTH
 
     def pane_bounds(self):
-        """Return ((c1x0,c1x1),(c2x0,c2x1),(c3x0,c3x1),y0,y1) — the column
-        ranges (inclusive) and content row range of the context, writing and
-        notes panes.
+        """Return (bounds, y0, y1) for the wide three-pane layout, where
+        bounds maps each pane name ("context","writing","notes") to its
+        inclusive (x0,x1) column range.
+
+        Pane order (left to right) is self.pane_order and each pane's width is
+        its share (self.pane_fractions) of the usable width, so the panes can
+        be rearranged and resized via "Adjust view".
 
         Layout (wide mode):
           row 5   pane headers (CONTEXT / WRITING / NOTES)
           row 6   separators, with the writing pane showing its margin ruler
-          row 7.. the shared content area (y0 .. y1-1)
-
-        All three panes are equal (~33% each): context on the left, writing in
-        the centre, notes on the right."""
+          row 7.. the shared content area (y0 .. y1-1)"""
         H,W=self.s.getmaxyx()
-        margin_left=8; margin_right=2; gap=2
+        # Leave a more generous gutter at the left edge so the leftmost pane
+        # sits further into the window instead of hugging the border.
+        margin_left=10; margin_right=2; gap=1
         inner=max(3,W-margin_left-margin_right-2*gap)
-        w1=max(1,int(inner*0.33))   # context (left)
-        w3=max(1,int(inner*0.33))   # notes (right)
-        w2=max(1,inner-w1-w3)       # writing (centre)
-        x1_0=margin_left; x1_1=x1_0+w1-1
-        x2_0=x1_1+gap+1; x2_1=x2_0+w2-1
-        x3_0=x2_1+gap+1; x3_1=min(W-1,x3_0+w3-1)
-        return (x1_0,x1_1),(x2_0,x2_1),(x3_0,x3_1),7,H-3
+        order=list(self.pane_order)
+        total=sum(self.pane_fractions.get(n,1.0) for n in order) or 1.0
+        # Proportional widths, at least 1 column each; the last pane absorbs
+        # the rounding remainder so the panes always tile the usable width.
+        widths=[]
+        for n in order:
+            widths.append(max(1,int(round(inner*self.pane_fractions.get(n,1.0)/total))))
+        widths[-1]=max(1,widths[-1]+(inner-sum(widths)))
+        bounds={}; x=margin_left
+        for n,wdt in zip(order,widths):
+            x1=min(W-1,x+wdt-1)
+            bounds[n]=(x,x1)
+            x=x1+gap+1
+        return bounds,7,H-3
+
+    def pane_at(self,x):
+        """Name of the pane whose column range contains x (wide mode), else None."""
+        bounds,_,_=self.pane_bounds()
+        for n in self.pane_order:
+            x0,x1=bounds[n]
+            if x0<=x<=x1:return n
+        return None
+
+    def begin_adjust_view(self):
+        """Enter view-adjust mode: interactive rulers on all three panes."""
+        if not self.wide_mode():
+            self.message="Adjust view needs the wide layout (terminal 150+ columns wide)."
+            return
+        self.layout_backup=(list(self.pane_order),dict(self.pane_fractions))
+        self.view_drag=None
+        self.adjust_view=True
+        self.message="ADJUST VIEW: drag a ruler to resize that pane · click a ruler to move the pane right · Esc when done"
+
+    def end_adjust_view(self):
+        """Leave view-adjust mode and ask whether to save the new layout."""
+        self.adjust_view=False
+        self.view_drag=None
+        answer=self.prompt("SAVE VIEW LAYOUT? (Y save / N revert) ")
+        if answer is None:
+            self.message="View kept for this session; not saved."
+            return
+        choice=answer.strip().lower()
+        if choice=="y":
+            self.save_layout()
+        elif choice=="n":
+            if self.layout_backup:
+                self.pane_order,self.pane_fractions=self.layout_backup
+            self.layout_backup=None
+            self.message="View layout reverted; not saved."
+        else:
+            self.message="Choose Y to save the view, N to revert."
+
+    def save_layout(self):
+        try:
+            self.state_dir.mkdir(parents=True,exist_ok=True,mode=0o700)
+            payload={"order":self.pane_order,"fractions":self.pane_fractions}
+            with tempfile.NamedTemporaryFile("w",encoding="utf-8",dir=self.state_dir,delete=False) as f:
+                json.dump(payload,f,ensure_ascii=False)
+                temp=Path(f.name)
+            os.replace(temp,self.layout_file)
+            self.message="View layout saved."
+        except OSError as e:
+            self.message=f"Cannot save view layout: {e}"
+
+    def _draw_active_ruler(self,row,x0,width,name):
+        """Interactive ruler bar shown while adjusting the view."""
+        label=f" ◄ {name.upper()} ► "
+        ticks="┊"*(max(0,width-len(label)))
+        self.put(row,x0,(label+ticks)[:width],curses.color_pair(2))
+
+    def _apply_drag(self,x):
+        """Resize the dragged pane so its edge follows x, borrowing from the
+        adjacent pane (right neighbour, or the left one for the rightmost)."""
+        name=self.view_drag["pane"]
+        bounds,_,_=self.pane_bounds()
+        order=self.pane_order
+        i=order.index(name)
+        if i+1<len(order):
+            other=order[i+1]; side="right"
+        else:
+            other=order[i-1]; side="left"
+        nx0,nx1=bounds[name]; ox0,ox1=bounds[other]
+        min_w=MIN_TEXT_WIDTH
+        pair=(nx1-nx0+1)+(ox1-ox0+1)
+        if side=="right":
+            new_w=x-nx0+1
+        else:
+            new_w=nx1-x+1
+        new_w=max(min_w,min(pair-min_w,new_w))
+        inner=sum(b[1]-b[0]+1 for b in bounds.values())
+        self.pane_fractions=dict(self.pane_fractions)
+        self.pane_fractions[name]=new_w/inner
+        self.pane_fractions[other]=(pair-new_w)/inner
+
+    def _finish_drag(self):
+        drag=self.view_drag
+        self.view_drag=None
+        if not drag:return
+        if drag["moved"]<=3:
+            # A click (no real movement): move the pane one step right,
+            # wrapping to the left, so repeated clicks cycle all positions.
+            count=len(self.pane_order)
+            i=self.pane_order.index(drag["pane"])
+            name=self.pane_order.pop(i)
+            self.pane_order.insert((i+1)%count,name)
+            pos=self.pane_order.index(name)+1
+            self.message=(f"Moved {name.upper()} to position {pos} of {len(self.pane_order)} · "
+                          "drag a ruler to resize · Esc when done")
+        else:
+            self.message=(f"Resized {drag['pane'].upper()} · "
+                          "drag a ruler to resize · click to move a pane · Esc when done")
+
+    def _adjust_mouse(self,x,y,b):
+        """Mouse handling while adjusting the view: the rulers (row 6) are
+        drag handles (resize) and click targets (move the pane).
+
+        ncurses builds differ in how they flag held-button motion (some use
+        BUTTON1_MOVED, some re-report BUTTON1_PRESSED at the new position,
+        and this one reports REPORT_MOUSE_POSITION), so while a drag is in
+        progress every non-release event is treated as a motion report."""
+        PRESSED=getattr(curses,"BUTTON1_PRESSED",0)
+        RELEASED=getattr(curses,"BUTTON1_RELEASED",0)
+        if self.view_drag is not None:
+            if b & RELEASED:
+                self._finish_drag()
+            else:
+                self._apply_drag(x)
+                self.view_drag["moved"]=max(self.view_drag["moved"],abs(x-self.view_drag["start_x"]))
+            return
+        # A fresh press over a ruler starts a drag on that pane.
+        if b & PRESSED and y==6:
+            name=self.pane_at(x)
+            if name:
+                self.view_drag={"pane":name,"start_x":x,"moved":0}
+                self.message=f"ADJUST VIEW: dragging {name.upper()} · release to keep · small move = move pane · Esc done"
 
     def effective_margins(self,page_width):
         left=max(0,self.left_margin); right=max(0,self.right_margin)
@@ -1394,12 +1767,47 @@ class WordProcessor:
         items=[]; line_to_di={}; used=0; capacity=self.page_line_capacity()
         for n,line in enumerate(self.lines):
             if line=="\f":
-                line_to_di[n]=len(items); items.append(("break",n)); used=0
+                # A page break is a single display row. Do not pad the rest of
+                # the terminal viewport with blank rows: doing so means the
+                # following page cannot render until the user scrolls through
+                # an entire page of empty rows, and the preceding page appears
+                # to vanish when scrolling back across the boundary.
+                line_to_di[n]=len(items); items.append(("break",n))
+                used=0
             else:
                 if used>=capacity:
-                    items.append(("sep",None)); used=0
+                    # Keep one visible boundary row between pages while keeping
+                    # the display list compact enough that adjacent pages are
+                    # rendered together as the user scrolls.
+                    items.append(("sep",None))
+                    used=0
                 line_to_di[n]=len(items); items.append(("text",n)); used+=1
         return items,line_to_di
+
+    def anchor_view(self):
+        """Set self.top so the cursor stays in the MIDDLE of the writing
+        area while typing, with the lines above and below it in view. A page
+        separator approaching from below (or just crossed above) stays
+        visible in the lower/upper half and scrolls past the cursor as new
+        lines are typed in."""
+        h,w=self.s.getmaxyx()
+        # Use the same visible height the layout actually draws the writing
+        # area with: the three-pane writing pane (rows 7..H-4) is one row
+        # shorter than the single-column editor (rows 6..H-4).
+        visible=max(1,h-10) if w>=WIDE_MIN_WIDTH else max(1,h-9)
+        items,line_to_di=self.display_items()
+        cursor_item=line_to_di.get(self.y, self.y)
+        # Anchor the cursor on the middle row of the writing area (clamped at
+        # the top of the document). Roughly half a screen of text stays
+        # visible below the cursor, so nothing below it is ever cut off.
+        start_di=max(0, cursor_item-visible//2)
+        # self.top is a line index; use the first line at (or after) the
+        # wanted display item.
+        top_line=None
+        for di2 in range(start_di, len(items)):
+            if items[di2][1] is not None:
+                top_line=items[di2][1]; break
+        self.top=max(0, top_line if top_line is not None else 0)
 
     def hunspell_dictionary(self):
         if self.spell_dictionary:return str(self.spell_dictionary)
@@ -1749,39 +2157,113 @@ class WordProcessor:
                 self.notes.insert(self.ny+1,rest); self.ny+=1; self.nx=0
             else:return
         self.notes_dirty=True
-        _,_,_,y0,y1=self.pane_bounds()
+        bounds,y0,y1=self.pane_bounds()
         pane_rows=max(1,y1-y0)
-        if self.ny<self.notes_top:self.notes_top=self.ny
-        elif self.ny>=self.notes_top+pane_rows:self.notes_top=self.ny-pane_rows+1
+        if self.wide_mode():
+            nx0,nx1=bounds["notes"]
+            notes_width=max(1,nx1-nx0+1)
+        else:
+            notes_width=max(1,self.s.getmaxyx()[1]-3)
+        notes_visual=self.notes_visual_row(self.ny,self.nx,notes_width)
+        if notes_visual<self.notes_top:self.notes_top=notes_visual
+        elif notes_visual>=self.notes_top+pane_rows:self.notes_top=notes_visual-pane_rows+1
 
     def handle_mouse(self):
-        """Click a pane to focus it: writing (centre) or notes (right).
-        The context pane (left) is read-only, so clicks there are ignored."""
-        if not self.wide_mode():return
+        """Handle pane clicks and mouse-wheel scrolling.
+
+        Wheel scrolling moves the viewport by one displayed line without
+        changing the insertion point. In the wide layout, the pane under the
+        pointer determines whether the writing document or notes are scrolled.
+        In the narrow layout, the currently focused pane is scrolled.
+        """
         try:
-            _id,x,y,_z,b=curses.getmouse()  # (id, x, y, z, bstate)
+            _id, x, y, _z, b = curses.getmouse()
         except curses.error:
             return
-        if not (b & (curses.BUTTON1_PRESSED|curses.BUTTON1_RELEASED|curses.BUTTON1_CLICKED)):return
-        c1,c2,c3,y0,y1=self.pane_bounds()
-        # Clickable area spans the pane header (row y0-2) and separator (row
-        # y0-1) down through the content; header/separator clicks land on the
-        # first content line.
-        if not (y0-2<=y<y1):return
-        if c2[0]<=x<=c2[1]:
-            if self.focus=="notes":self.save_notes()
-            self.focus="editor"
-            line=self.top+max(0,y-y0)
-            self.y=max(0,min(len(self.lines)-1,line))
-            self.x=max(0,min(len(self.lines[self.y]),x-c2[0]))
-            self.message="Focus: WRITING (F12 back to notes)"
-        elif c3[0]<=x<=c3[1]:
-            self.focus="notes"
-            line=self.notes_top+max(0,y-y0)
-            self.ny=max(0,min(len(self.notes)-1,line))
-            self.nx=max(0,min(len(self.notes[self.ny]),x-c3[0]))
-            self.message="Focus: NOTES (F12 back to writing)"
-        # c1 (context) is read-only: no focus change
+
+        # ncurses reports the wheel as BUTTON4 (up) and BUTTON5 (down) on
+        # common terminals. Accept PRESSED and CLICKED variants where defined.
+        wheel_up = b & (getattr(curses, "BUTTON4_PRESSED", 0) |
+                        getattr(curses, "BUTTON4_CLICKED", 0))
+        wheel_down = b & (getattr(curses, "BUTTON5_PRESSED", 0) |
+                          getattr(curses, "BUTTON5_CLICKED", 0))
+        if wheel_up or wheel_down:
+            delta = -1 if wheel_up else 1
+            if self.wide_mode():
+                bounds, y0, y1 = self.pane_bounds()
+                if not (y0 <= y < y1):
+                    return
+                name = self.pane_at(x)
+                if name == "notes":
+                    self.focus = "notes"
+                    rows = max(1, y1 - y0)
+                    nx0, nx1 = bounds["notes"]
+                    notes_width = max(1, nx1 - nx0 + 1)
+                    visual_total = sum(max(1, (len(line) + notes_width - 1) // notes_width)
+                                       for line in self.notes)
+                    self.notes_top = max(0, min(max(0, visual_total - rows),
+                                                self.notes_top + delta))
+                elif name == "writing":
+                    self.focus = "editor"
+                    self.top = max(0, min(max(0, len(self.lines) - 1), self.top + delta))
+                else:
+                    # The context pane is read-only; scrolling over it scrolls
+                    # the document viewport so the user can browse its source.
+                    self.top = max(0, min(max(0, len(self.lines) - 1), self.top + delta))
+            elif self.focus == "notes":
+                h, w = self.s.getmaxyx()
+                rows = max(1, h - 3 - 5)
+                notes_width = max(1, w - 3)
+                visual_total = sum(max(1, (len(line) + notes_width - 1) // notes_width)
+                                   for line in self.notes)
+                self.notes_top = max(0, min(max(0, visual_total - rows),
+                                            self.notes_top + delta))
+            else:
+                self.top = max(0, min(max(0, len(self.lines) - 1), self.top + delta))
+            return
+
+        # Left-button events in adjust-view mode drive the rulers. The
+        # REPORT bit is included because this ncurses build reports
+        # held-button motion with it instead of a BUTTON1_MOVED flag.
+        b1_any = (getattr(curses, "BUTTON1_PRESSED", 0) |
+                  getattr(curses, "BUTTON1_RELEASED", 0) |
+                  getattr(curses, "BUTTON1_CLICKED", 0) |
+                  getattr(curses, "BUTTON1_MOVED", 0) |
+                  getattr(curses, "MOUSE_MOVED", 0) |
+                  getattr(curses, "REPORT_MOUSE_POSITION", 0))
+        if self.adjust_view and (b & b1_any):
+            self._adjust_mouse(x, y, b)
+            return
+
+        # Ordinary left-clicks select the writing or notes pane in wide mode.
+        if not (b & (getattr(curses, "BUTTON1_PRESSED", 0) |
+                     getattr(curses, "BUTTON1_RELEASED", 0) |
+                     getattr(curses, "BUTTON1_CLICKED", 0))):
+            return
+        if not self.wide_mode():
+            return
+        bounds, y0, y1 = self.pane_bounds()
+        # Clickable area spans the pane header and separator through content.
+        if not (y0 - 2 <= y < y1):
+            return
+        name = self.pane_at(x)
+        if name == "writing":
+            if self.focus == "notes":
+                self.save_notes()
+            self.focus = "editor"
+            wx0, wx1 = bounds["writing"]
+            line = self.top + max(0, y - y0)
+            self.y = max(0, min(len(self.lines) - 1, line))
+            self.x = max(0, min(len(self.lines[self.y]), x - wx0))
+            self.message = "Focus: WRITING (F12 back to notes)"
+        elif name == "notes":
+            self.focus = "notes"
+            nx0, nx1 = bounds["notes"]
+            line = self.notes_top + max(0, y - y0)
+            self.ny = max(0, min(len(self.notes) - 1, line))
+            self.nx = max(0, min(len(self.notes[self.ny]), x - nx0))
+            self.message = "Focus: NOTES (F12 back to writing)"
+        # The context pane is read-only: clicks there are ignored.
 
     def quit_flow(self):
         if not self.dirty:
@@ -1817,15 +2299,28 @@ class WordProcessor:
             self.draw(); h,w=self.s.getmaxyx()
             if expanded:
                 items=MENUS[TABS[self.tab]]
-                labels=[f"Paper size ({self.page_preset})" if item=="Paper size" else item for item in items]
+                labels=[(f"Paper size ({self.page_preset})" if item=="Paper size" else
+                         f"Auto capitalisation ({'On' if self.auto_capitalise else 'Off'})" if item=="Auto capitalisation" else item) for item in items]
                 width=min(max(map(len,labels))+4,w-4)
                 x=min(2+self.tab*max(7,(w-4)//len(TABS)),w-width-2)
+                # Box the deployed menu below the menu-bar title. Use the
+                # same foreground colour as the editor text, and keep the
+                # tab title (FILE/STYLE/SCROLL...) outside the box.
+                border_attr=curses.color_pair(1)
+                top=4
+                self.put(top,x,"┌"+"─"*(width-2)+"┐",border_attr)
                 for i,label in enumerate(labels):
-                    self.put(4+i,x,(" "+label).ljust(width),curses.color_pair(2) if i==selected else curses.color_pair(1))
+                    self.put(top+1+i,x,"│"+(" "+label).ljust(width-2)+"│",
+                             curses.color_pair(2) if i==selected else border_attr)
+                self.put(top+1+len(labels),x,"└"+"─"*(width-2)+"┘",border_attr)
             self.s.refresh()
             try:k=self.s.get_wch()
             except KeyboardInterrupt:
-                self.ctrl_c_pending=True; return
+                # Ctrl+C while browsing a menu should quit WordPro directly,
+                # rather than merely closing the menu and resuming the editor.
+                self.ctrl_c_pending=False
+                self.quit_flow()
+                return
             except curses.error:continue
             if k == "\x13":
                 self.save()
@@ -1930,13 +2425,32 @@ class WordProcessor:
                 continue
             except curses.error:
                 if self.dirty and time.monotonic()>=next_recovery:
-                    self.write_recovery(); next_recovery=time.monotonic()+2
+                    self.write_recovery(quiet=True); next_recovery=time.monotonic()+2
+                continue
+            if self.adjust_view:
+                # Adjusting the view: the mouse drives the rulers, Esc ends
+                # the mode (and asks about saving the layout). Typing and the
+                # other shortcuts are ignored so the document cannot change.
+                if k==curses.KEY_MOUSE:
+                    self.handle_mouse()
+                elif k in (27,"\x1b"):
+                    self.end_adjust_view()
+                if self.quit_requested:break
+                if self.ctrl_c_pending:
+                    self.ctrl_c_pending=False; self.quit_flow()
+                    if self.quit_requested:break
                 continue
             if k==curses.KEY_MOUSE:
                 self.handle_mouse()
             elif isinstance(k,str):
                 if k=="\x13":self.save()
                 elif k=="\x0f":self.open_file()
+                elif k=="\x06":
+                    # First Ctrl+F prompts; later presses jump to the next match.
+                    if self.find_term:
+                        self.find_next_match()
+                    else:
+                        self.action("Find")
                 elif k=="\x04":
                     self.go_to_main_menu()
                     continue
@@ -1955,9 +2469,6 @@ class WordProcessor:
                 elif self.focus=="notes":
                     self.notes_key(k)
                 elif k in ("\n","\r"):
-                    # A newline is what puts words onto separate lines — log
-                    # the recent key trail so an unexpected split can be traced
-                    # to the exact events that arrived (space vs Enter etc.).
                     if self.lines[self.y]=="\f":
                         self.lines[self.y]=""; self.lines.insert(self.y+1,"\f")
                         fmt=self.line_formats[self.y].copy(); self.line_formats[self.y:self.y+1]=[fmt,fmt.copy()]
@@ -1978,6 +2489,32 @@ class WordProcessor:
                     self.lines[self.y]=self.lines[self.y][:self.x]+"    "+self.lines[self.y][self.x:]
                     self.x+=4; self.dirty=True; self.wrap_current_line()
                 elif k.isprintable():
+                    # Auto-capitalise sentence starts and the standalone pronoun "I".
+                    # Apply this before normal insertion so cursor/wrapping logic stays shared.
+                    if self.auto_capitalise and self.lines[self.y] != "\f":
+                        line = self.lines[self.y]
+                        prefix = line[:self.x]
+                        if k.isalpha():
+                            # Only capitalise at the start of the document, after
+                            # a blank paragraph, or after sentence punctuation.
+                            # A wrapped/continued line by itself is NOT a sentence.
+                            trimmed = prefix.rstrip()
+                            at_sentence_start = bool(trimmed and
+                                trimmed[-1:] in (".", "!", "?", "…") and len(trimmed) < len(prefix))
+                            if not prefix and self.y == 0:
+                                at_sentence_start = True
+                            elif not prefix and self.y > 0:
+                                previous = self.lines[self.y-1]
+                                at_sentence_start = (not previous.strip() or previous == "\f" or
+                                    bool(previous.rstrip() and previous.rstrip()[-1:] in (".", "!", "?", "…")))
+                            if at_sentence_start:
+                                k = k.upper()
+                        # When a delimiter completes a standalone "i", capitalise it.
+                        if k.isspace() or k in (".", ",", "!", "?", ";", ":", ")", "\"", "\'"):
+                            match = re.search(r"(?i)(?<![\w])i$", prefix)
+                            if match:
+                                line = line[:match.start()] + "I" + line[match.end():]
+                                self.lines[self.y] = line
                     if self.lines[self.y]=="\f":self.lines[self.y]=k; self.x=1
                     else:
                         self.lines[self.y]=self.lines[self.y][:self.x]+k+self.lines[self.y][self.x:]
@@ -2029,11 +2566,9 @@ class WordProcessor:
                 if self.quit_requested:break
                 continue
             if self.dirty and time.monotonic()>=next_recovery:
-                self.write_recovery(); next_recovery=time.monotonic()+2
+                self.write_recovery(quiet=True); next_recovery=time.monotonic()+2
             if self.notes_dirty:self.save_notes()
-            h,_=self.s.getmaxyx()
-            visible=max(1,h-9)
-            self.top=max(0,self.y-visible//2)
+            self.anchor_view()
         if self.path:self.save_position()
         if self.notes_dirty:self.save_notes()
         if not self.preserve_recovery:self.clear_recovery()

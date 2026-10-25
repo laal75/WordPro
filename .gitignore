@@ -1,0 +1,30 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Editor/IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# WordPro user documents and recovery data
+*.rtf
+*.txt.old
+*.rtf.old
+
+# Local runtime/log files
+*.log
+*.pid
+
+# Build/package artifacts
+*.tar.gz
+*.zip
+PKGDEST/
+src/
+pkg/
