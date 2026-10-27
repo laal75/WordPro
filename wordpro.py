@@ -37,6 +37,11 @@ WIDE_MIN_WIDTH=150
 # width mid-typing) can never collapse the wrap width into one-word-per-line
 # fragments.
 MIN_TEXT_WIDTH=30
+# Closing punctuation that must never be stranded alone at the start of a
+# wrapped line: when a wrap would leave one of these on its own at the start
+# of the next line (e.g. "gold ." wrapping to "gold" + "."), the previous
+# word is pulled down onto the new line with it.
+WRAP_KEEP_WITH_WORD=".,;:!?)]}…"
 
 class WordProcessor:
     def __init__(self, screen):
@@ -412,7 +417,7 @@ class WordProcessor:
                     if end < len(line):
                         split=line.rfind(" ",pos,end+1)
                         if split > pos:
-                            end=split
+                            end=self.refine_wrap_cut(line,split,pos)
                     chunk=line[pos:end]
                     visual.append((logical_i,pos,chunk))
                     pos=end
@@ -463,7 +468,7 @@ class WordProcessor:
                 if end < len(line):
                     split=line.rfind(" ",pos,end+1)
                     if split > pos:
-                        end=split
+                        end=self.refine_wrap_cut(line,split,pos)
                 starts.append(pos)
                 pos=end
                 while pos < len(line) and line[pos]==" ":
@@ -1926,6 +1931,21 @@ class WordProcessor:
             elif key==curses.KEY_DOWN:offset=min(max(0,len(page_lines)-view_height),offset+1)
             elif key==curses.KEY_UP:offset=max(0,offset-1)
 
+    def refine_wrap_cut(self,text,cut,floor=0):
+        """Refine a wrap cut (the index of the space where the line ends):
+        if the next line would start with a lone piece of closing punctuation,
+        or would be blank, pull the previous word down with it, so "gold ."
+        wraps as "…15" + "gold ." rather than "…15 gold" + "."."""
+        while cut>floor:
+            rest=text[cut+1:]
+            if rest[:1] not in WRAP_KEEP_WITH_WORD and rest.strip():
+                break
+            prev=text.rfind(" ",floor,cut)
+            if prev<=floor:
+                break
+            cut=prev
+        return cut
+
     def wrap_document(self):
         self.sync_line_formats(); width=self.content_width(); wrapped=[]; wrapped_formats=[]
         for line,fmt in zip(self.lines,self.line_formats):
@@ -1934,12 +1954,13 @@ class WordProcessor:
             while len(line)>width:
                 cut=line.rfind(" ",0,width+1)
                 if cut<=0:cut=width; skip=0
-                else:skip=1
+                else:skip=1; cut=self.refine_wrap_cut(line,cut)
                 wrapped.append(line[:cut])
                 wrapped_formats.append(fmt.copy())
                 line=line[cut+skip:].lstrip(" ")
-            wrapped.append(line)
-            wrapped_formats.append(fmt.copy())
+            if line:
+                wrapped.append(line)
+                wrapped_formats.append(fmt.copy())
         self.lines=wrapped or [""]
         self.line_formats=wrapped_formats or [{"heading":0,"size":10}]
 
@@ -2014,13 +2035,15 @@ class WordProcessor:
                 skip = 0
             else:
                 skip = 1
+                cut = self.refine_wrap_cut(remaining, cut)
             wrapped.append(remaining[:cut])
             consumed = cut + skip
             offsets.append(consumed_total)
             remaining = remaining[consumed:]
             consumed_total += consumed
-        wrapped.append(remaining)
-        offsets.append(consumed_total)
+        if remaining:
+            wrapped.append(remaining)
+            offsets.append(consumed_total)
 
         # Find which newly wrapped line contains the cursor offset.
         new_y = start
